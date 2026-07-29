@@ -121,6 +121,7 @@ run_spawn() {
     FM_FAKE_POOL_PATH="${FM_FAKE_POOL_PATH:-$CASE_WT_A}" \
     FM_FAKE_POOL_STATUS="${FM_FAKE_POOL_STATUS:-leased}" \
     FM_FAKE_LEASE_HOLDER="${FM_FAKE_LEASE_HOLDER-fm-$id}" \
+    FM_FAKE_TREEHOUSE_STATE_FILE="${FM_FAKE_TREEHOUSE_STATE_FILE:-}" \
     FM_FAKE_TREEHOUSE_LOG="$CASE_TREEHOUSE_LOG" \
     FM_FAKE_WINDOWS="${FM_FAKE_WINDOWS:-}" FM_FAKE_PANE_COMMAND="${FM_FAKE_PANE_COMMAND:-bash}" \
     PATH="$CASE_FAKEBIN:$PATH" \
@@ -133,6 +134,10 @@ run_adopt() {
     FM_CONFIG_OVERRIDE="$CASE_HOME/config" FM_FAKE_POOL_PATH="$CASE_WT_A" \
     FM_FAKE_POOL_STATUS="${FM_FAKE_POOL_STATUS:-in-use}" \
     FM_FAKE_LEASE_HOLDER="${FM_FAKE_LEASE_HOLDER:-}" \
+    FM_FAKE_TREEHOUSE_STATE_FILE="${FM_FAKE_TREEHOUSE_STATE_FILE:-}" \
+    FM_FAKE_STATUS_MUTATE_FILE="${FM_FAKE_STATUS_MUTATE_FILE:-}" \
+    FM_FAKE_STATUS_MUTATE_MARKER="${FM_FAKE_STATUS_MUTATE_MARKER:-}" \
+    FM_FAKE_STATUS_MUTATE_TEXT="${FM_FAKE_STATUS_MUTATE_TEXT:-}" \
     FM_FAKE_WINDOWS="" PATH="$CASE_FAKEBIN:$PATH" \
     "$ROOT/bin/fm-adopt-worktree.sh" "$id" 2>&1
 }
@@ -324,8 +329,8 @@ test_project_change_refuses() {
   pass "a relaunch whose record names another project refuses"
 }
 
-test_legacy_copy_requires_adoption_and_manifest_stays_current() {
-  local id out status before
+test_legacy_copy_requires_durable_lease() {
+  local id out status before state handoff_hash
   id=recovery-adopt-a7
   make_case adoption "$id"
   out=$(run_spawn "$id" "$CASE_WT_A")
@@ -340,17 +345,24 @@ test_legacy_copy_requires_adoption_and_manifest_stays_current() {
   out=$(FM_FAKE_POOL_STATUS=in-use FM_FAKE_LEASE_HOLDER='' run_spawn "$id" "$CASE_WT_B")
   status=$?
   expect_code 1 "$status" "legacy relaunch without durable proof should refuse"
-  assert_contains "$out" 'fm-adopt-worktree.sh' "refusal did not point to guarded adoption"
+  assert_contains "$out" 'fm-adopt-worktree.sh' "refusal did not point to guarded lease adoption"
   [ "$before" = "$(cat "$CASE_HOME/state/$id.meta")" ] || fail "refusal changed the legacy record"
   assert_grep 'preserve exactly' "$CASE_WT_A/handoff.md" "refusal changed legacy content"
 
-  out=$(FM_FAKE_POOL_STATUS=in-use FM_FAKE_LEASE_HOLDER='' run_adopt "$id")
-  expect_code 0 "$?" "guarded legacy adoption should succeed: $out"
+  state="$(dirname "$(dirname "$CASE_WT_A")")/treehouse-state.json"
+  printf '{"worktrees":[{"name":"1","path":"%s","test_status":"in-use","owner_pid":999999,"owner_started_at":1},{"name":"2","path":"%s","test_status":"available"}]}\n' \
+    "$CASE_WT_A" "$CASE_WT_B" > "$state"
+  handoff_hash=$(sha256sum "$CASE_WT_A/handoff.md")
+  out=$(FM_FAKE_TREEHOUSE_STATE_FILE="$state" run_adopt "$id")
+  expect_code 0 "$?" "guarded legacy adoption should acquire the lease: $out"
+  assert_grep "\"lease_holder\": \"fm-$id\"" "$state" "adoption did not acquire the task lease"
+  [ "$handoff_hash" = "$(sha256sum "$CASE_WT_A/handoff.md")" ] \
+    || fail "adoption changed the untracked handoff"
 
   out=$(FM_FAKE_POOL_STATUS=available FM_FAKE_LEASE_HOLDER='' run_spawn "$id" "$CASE_WT_B")
   status=$?
   expect_code 1 "$status" "adopted copy that became available should refuse"
-  assert_contains "$out" 'current treehouse pool status is available' \
+  assert_contains "$out" 'status=available' \
     "available refusal did not report the current pool state"
   assert_grep 'preserve exactly' "$CASE_WT_A/handoff.md" \
     "available-state refusal changed adopted content"
@@ -358,23 +370,40 @@ test_legacy_copy_requires_adoption_and_manifest_stays_current() {
   out=$(FM_FAKE_POOL_STATUS=leased FM_FAKE_LEASE_HOLDER=foreign-holder run_spawn "$id" "$CASE_WT_B")
   status=$?
   expect_code 1 "$status" "adopted copy with a foreign lease should refuse"
-  assert_contains "$out" 'current treehouse lease holder is foreign-holder' \
+  assert_contains "$out" 'holder=foreign-holder' \
     "foreign-lease refusal did not report the current holder"
   assert_grep 'preserve exactly' "$CASE_WT_A/handoff.md" \
     "foreign-lease refusal changed adopted content"
 
-  out=$(FM_FAKE_POOL_STATUS=in-use FM_FAKE_LEASE_HOLDER='' run_spawn "$id" "$CASE_WT_B")
-  expect_code 0 "$?" "relaunch with matching adoption proof should succeed: $out"
-  assert_grep "cd '$CASE_WT_A'" "$CASE_SENT_FILE" "adopted relaunch did not enter the legacy copy"
+  out=$(FM_FAKE_TREEHOUSE_STATE_FILE="$state" run_spawn "$id" "$CASE_WT_B")
+  expect_code 0 "$?" "relaunch with an exact durable lease should succeed: $out"
+  assert_grep "cd '$CASE_WT_A'" "$CASE_SENT_FILE" "leased relaunch did not enter the recovered copy"
+  assert_present "$CASE_WT_A/handoff.md" "relaunch lost the untracked handoff"
 
-  printf 'changed after adoption\n' >> "$CASE_WT_A/handoff.md"
   : > "$CASE_CWD_FILE"
-  out=$(FM_FAKE_POOL_STATUS=in-use FM_FAKE_LEASE_HOLDER='' run_spawn "$id" "$CASE_WT_B")
-  status=$?
-  expect_code 1 "$status" "relaunch after adopted content changes should refuse"
-  assert_contains "$out" 'manifest missing/mismatched' "refusal did not identify stale adoption proof"
-  assert_grep 'changed after adoption' "$CASE_WT_A/handoff.md" "stale-proof refusal changed content"
-  pass "legacy relaunch requires current adoption proof and preserves the copy"
+  : > "$CASE_SENT_FILE"
+  : > "$CASE_TREEHOUSE_LOG"
+  allocated=$(FM_FAKE_TREEHOUSE_LOG="$CASE_TREEHOUSE_LOG" \
+    FM_FAKE_TREEHOUSE_STATE_FILE="$state" \
+    "$CASE_FAKEBIN/treehouse" get --lease --lease-holder another-task)
+  [ "$allocated" = "$CASE_WT_B" ] \
+    || fail "post-exit allocation selected ${allocated:-nothing} instead of the available copy"
+  assert_grep "get --lease --lease-holder another-task" "$CASE_TREEHOUSE_LOG" \
+    "post-exit allocation was not exercised"
+  assert_grep '"lease_holder": "another-task"' "$state" \
+    "post-exit allocation did not mark the available copy"
+  [ "$(python3 - "$state" "$CASE_WT_A" <<'PY'
+import json, sys
+with open(sys.argv[1]) as handle:
+    state = json.load(handle)
+entry = next(item for item in state["worktrees"] if item["path"] == sys.argv[2])
+print(entry.get("lease_holder", ""))
+PY
+)" = "fm-$id" ] || fail "post-exit allocation replaced the adopted copy's lease"
+  assert_present "$CASE_WT_A/handoff.md" "post-exit allocation recycled the recovered copy"
+  [ "$handoff_hash" = "$(sha256sum "$CASE_WT_A/handoff.md")" ] \
+    || fail "post-exit allocation changed the recovered handoff"
+  pass "recovered work stays leased and preserves its untracked handoff after worker exit"
 }
 
 test_holderless_record_uses_current_native_lease_proof() {
@@ -409,13 +438,52 @@ test_holderless_record_uses_current_native_lease_proof() {
   pass "holder-less records trust only an exact matching current native lease"
 }
 
+test_quarantined_adoption_refuses_relaunch() {
+  local id state marker out status changed_hash
+  id=recovery-quarantine-a9
+  make_case quarantine "$id"
+  out=$(run_spawn "$id" "$CASE_WT_A")
+  expect_code 0 "$?" "first spawn should succeed"
+  sed '/^lease_holder=/d' "$CASE_HOME/state/$id.meta" > "$CASE_HOME/state/$id.meta.new"
+  mv "$CASE_HOME/state/$id.meta.new" "$CASE_HOME/state/$id.meta"
+  printf 'original handoff\n' > "$CASE_WT_A/handoff.md"
+  state="$(dirname "$(dirname "$CASE_WT_A")")/treehouse-state.json"
+  printf '{"worktrees":[{"name":"1","path":"%s","test_status":"in-use","owner_pid":999999,"owner_started_at":1},{"name":"2","path":"%s","test_status":"available"}]}\n' \
+    "$CASE_WT_A" "$CASE_WT_B" > "$state"
+  marker="$TMP_ROOT/quarantine-mutated"
+
+  out=$(FM_FAKE_TREEHOUSE_STATE_FILE="$state" \
+    FM_FAKE_STATUS_MUTATE_FILE="$CASE_WT_A/handoff.md" \
+    FM_FAKE_STATUS_MUTATE_MARKER="$marker" \
+    FM_FAKE_STATUS_MUTATE_TEXT='concurrent handoff' run_adopt "$id")
+  status=$?
+  expect_code 1 "$status" "concurrent mutation should quarantine adoption"
+  changed_hash=$(sha256sum "$CASE_WT_A/handoff.md")
+
+  out=$(FM_FAKE_TREEHOUSE_STATE_FILE="$state" run_adopt "$id")
+  status=$?
+  expect_code 1 "$status" "quarantined adoption retry should refuse"
+  assert_absent "$CASE_HOME/state/$id.worktree-adoption" "retry published adoption proof"
+
+  : > "$CASE_CWD_FILE"
+  out=$(FM_FAKE_TREEHOUSE_STATE_FILE="$state" run_spawn "$id" "$CASE_WT_B")
+  status=$?
+  expect_code 1 "$status" "quarantined adoption should refuse relaunch"
+  assert_contains "$out" 'adoption manifest missing/mismatched' \
+    "relaunch did not identify quarantined adoption proof"
+  [ "$changed_hash" = "$(sha256sum "$CASE_WT_A/handoff.md")" ] \
+    || fail "quarantined retry or relaunch changed handoff content"
+  pass "quarantined adoption refuses retry and relaunch without changing content"
+}
+
 test_relaunch_reuses_recorded_worktree
 test_live_recorded_endpoint_refuses
 test_kind_change_refuses
 test_project_change_refuses
 test_unresolvable_recorded_worktree_refuses
 test_fresh_task_still_allocates
-test_legacy_copy_requires_adoption_and_manifest_stays_current
+test_legacy_copy_requires_durable_lease
 test_holderless_record_uses_current_native_lease_proof
+test_quarantined_adoption_refuses_relaunch
 
 echo "# all fm-spawn-recovery-guard tests passed"

@@ -116,6 +116,8 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
 For treehouse-backed ship and scout work, `fm-spawn.sh` takes a durable lease under the task id and enters the leased worktree directly, so an agent or pane exit cannot return the worktree automatically.
 The spawn fails closed if it cannot take the lease or if the resolved task path is not a real git worktree root distinct from the project primary checkout.
+Recovery reuses a recorded legacy worktree only after its endpoint is confirmed dead or missing and `fm-adopt-worktree.sh` has atomically converted the exact unchanged pool allocation into the task's durable lease.
+The adoption path binds its preservation proof to the original allocation state and content manifest, quarantines interrupted or concurrently changed attempts, and makes relaunch refuse unless both the lease and proof remain exact; `tests/fm-adopt-worktree.test.sh` and `tests/fm-spawn-recovery-guard.test.sh` cover that boundary.
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
 Its operating checkout (`FM_ROOT`) and the disposable crewmate worktrees are all linked git worktrees of the same repository, so the valid discriminator is branch state, not whether the checkout is linked.
@@ -166,6 +168,7 @@ Seeding is transactional: if validation, cloning, initialization, or registry up
 The same project may appear in multiple secondmate homes when their scopes differ, such as issue triage versus feature development.
 Secondmates are idle by default: after startup recovery reconciles only work already in their own home, an empty queue waits silently for routed tasks, and they never self-initiate surveys or audits.
 When called with `FM_HOME=<this-firstmate-home>` or when `FM_HOME` is already set to the active firstmate home, metadata-routed `fm-send.sh` requests to a live `kind=secondmate` use the live-charter-compatible `from-firstmate` carrier owned by `bin/fm-operational-input.sh`, so the secondmate returns terse answers through status lines and detailed answers through docs plus status pointers instead of replying only in its own chat.
+Slash commands are the exception: `fm-send.sh` delivers them to the secondmate TUI verbatim without the carrier or a pending-reply record because they are harness-local commands rather than routed prompts.
 The parent guards every marked request against a missing correlated report without reading the secondmate conversation; `bin/fm-pending-reply-lib.sh` owns the correlation, recovery, escalation, and retention contract.
 Explicit backend-target sends and direct human typing stay unmarked, so captain intervention in a secondmate pane remains conversational.
 After seeding a secondmate, `fm-backlog-handoff.sh` validates the fleet-specific handoff, then atomically delegates already-judged in-scope queued item moves to `tasks-axi mv` so the domain queue starts in the right place.

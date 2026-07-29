@@ -4,10 +4,7 @@
 # The task record must name a ship or scout whose endpoint is recovery-grade
 # dead or missing and whose isolated worktree still belongs to the same project.
 # The pool entry must be in-use or dirty and unleased, or already leased to the
-# expected fm-<task-id> holder. Available, absent, unreadable, and foreign-lease
-# states refuse without changing the task copy.
-# Adoption records verified content preservation; it does not transfer, lease,
-# clean, return, delete, or otherwise modify the worktree.
+# expected fm-<task-id> holder. Every other pool state refuses.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +24,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 META="$STATE/$ID.meta"
 ADOPTION="$STATE/$ID.worktree-adoption"
+PENDING="$STATE/$ID.worktree-adoption-pending"
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
@@ -41,6 +39,25 @@ field() {
 refuse() {
   echo "error: cannot adopt worktree for $ID: $1" >&2
   exit 1
+}
+
+write_manifest_record() {
+  local destination=$1 temporary="$1.tmp.$$"
+  trap 'rm -f "$temporary"' EXIT HUP INT TERM
+  {
+    echo "task_id=$ID"
+    echo "worktree=$WORKTREE_REAL"
+    echo "project=$PROJECT_REAL"
+    echo "pool_status=leased"
+    echo "expected_holder=$EXPECTED"
+    echo "allocation_evidence=$EXPECTED_STATE_EVIDENCE"
+    echo "manifest_digest=$FM_WORKTREE_MANIFEST_DIGEST"
+    echo "manifest_body_begin"
+    [ -z "$FM_WORKTREE_MANIFEST_BODY" ] || printf '%s\n' "$FM_WORKTREE_MANIFEST_BODY"
+    echo "manifest_body_end"
+  } > "$temporary"
+  mv "$temporary" "$destination"
+  trap - EXIT HUP INT TERM
 }
 
 [ -f "$META" ] && [ ! -L "$META" ] && [ -r "$META" ] || refuse "task record is not a readable regular file"
@@ -67,35 +84,61 @@ AGENT_STATE=$(fm_backend_agent_state "$BACKEND" "$TARGET")
 case "$AGENT_STATE" in dead|missing) ;; *) refuse "recorded endpoint $TARGET is $AGENT_STATE" ;; esac
 
 EXPECTED="fm-$ID"
+fm_worktree_state_evidence "$WORKTREE_REAL" || refuse "treehouse allocation evidence is unreadable"
+EXPECTED_STATE_EVIDENCE=$FM_WORKTREE_STATE_EVIDENCE
 fm_worktree_pool_lookup "$PROJECT_REAL" "$WORKTREE_REAL" || refuse "treehouse pool state is unreadable"
 [ "$FM_WORKTREE_POOL_RESULT" = present ] || refuse "worktree is absent from the treehouse pool"
-if [ "$FM_WORKTREE_POOL_STATUS" = leased ] && [ "$FM_WORKTREE_POOL_HOLDER" = "$EXPECTED" ]; then
-  echo "verified: $WORKTREE_REAL is already leased to $EXPECTED; adoption is unnecessary"
-  exit 0
+if [ -e "$PENDING" ]; then
+  [ "$(grep -c '^allocation_evidence=' "$PENDING" 2>/dev/null || true)" = 1 ] \
+    || refuse "partial adoption evidence has no single allocation digest"
+  STORED_STATE_EVIDENCE=$(grep '^allocation_evidence=' "$PENDING" | cut -d= -f2-)
+  [ "$STORED_STATE_EVIDENCE" = "$EXPECTED_STATE_EVIDENCE" ] \
+    || refuse "partial adoption evidence is quarantined because allocation ownership changed"
+  EXPECTED_STATE_EVIDENCE=$STORED_STATE_EVIDENCE
 fi
 if [ "$FM_WORKTREE_POOL_STATUS" = leased ]; then
-  refuse "worktree is leased to ${FM_WORKTREE_POOL_HOLDER:-an unknown holder}"
+  [ "$FM_WORKTREE_POOL_HOLDER" = "$EXPECTED" ] \
+    || refuse "worktree is leased to ${FM_WORKTREE_POOL_HOLDER:-an unknown holder}, not $EXPECTED"
+  if [ -e "$PENDING" ]; then
+    fm_worktree_adoption_proves "$PENDING" "$ID" "$WORKTREE_REAL" "$PROJECT_REAL" "$EXPECTED" \
+      || refuse "partial adoption evidence is quarantined because its original manifest no longer matches"
+  fi
+else
+  case "$FM_WORKTREE_POOL_STATUS" in
+    in-use|in_use|dirty) ;;
+    available) refuse "worktree is available and may already have been recycled" ;;
+    *) refuse "pool status $FM_WORKTREE_POOL_STATUS is not an adoptable legacy state" ;;
+  esac
+  if [ -e "$PENDING" ]; then
+    fm_worktree_adoption_proves "$PENDING" "$ID" "$WORKTREE_REAL" "$PROJECT_REAL" "$EXPECTED" \
+      || refuse "partial adoption evidence is quarantined because its original manifest no longer matches"
+  else
+    fm_worktree_content_manifest "$WORKTREE_REAL" || refuse "content manifest could not be captured"
+    write_manifest_record "$PENDING"
+    fm_worktree_adoption_proves "$PENDING" "$ID" "$WORKTREE_REAL" "$PROJECT_REAL" "$EXPECTED" \
+      || refuse "pre-acquisition manifest record could not be verified"
+  fi
+  BEFORE_DIGEST=$(grep '^manifest_digest=' "$PENDING" | cut -d= -f2-)
+  BEFORE_BODY=$(sed -n '/^manifest_body_begin$/,/^manifest_body_end$/p' "$PENDING" | sed '1d;$d')
+  fm_worktree_acquire_existing_lease \
+    "$WORKTREE_REAL" "$EXPECTED" "$EXPECTED_STATE_EVIDENCE" "$FM_WORKTREE_POOL_STATUS" \
+    || refuse "durable lease acquisition failed"
+  fm_worktree_proven_lease "$PROJECT_REAL" "$WORKTREE_REAL" "$EXPECTED" \
+    || refuse "acquired lease could not be verified"
+  fm_worktree_content_manifest "$WORKTREE_REAL" || refuse "content manifest could not be verified"
+  [ "$BEFORE_DIGEST" = "$FM_WORKTREE_MANIFEST_DIGEST" ] \
+    && [ "$BEFORE_BODY" = "$FM_WORKTREE_MANIFEST_BODY" ] \
+    || refuse "worktree content changed during lease acquisition"
 fi
-case "$FM_WORKTREE_POOL_STATUS" in
-  in-use|in_use|dirty) ;;
-  available) refuse "worktree is available and may already have been recycled" ;;
-  *) refuse "pool status $FM_WORKTREE_POOL_STATUS is not an adoptable legacy state" ;;
-esac
 
 fm_worktree_content_manifest "$WORKTREE_REAL" || refuse "content manifest could not be captured"
-TMP="$ADOPTION.tmp.$$"
-trap 'rm -f "$TMP"' EXIT HUP INT TERM
-{
-  echo "task_id=$ID"
-  echo "worktree=$WORKTREE_REAL"
-  echo "project=$PROJECT_REAL"
-  echo "pool_status=$FM_WORKTREE_POOL_STATUS"
-  echo "expected_holder=$EXPECTED"
-  echo "manifest_digest=$FM_WORKTREE_MANIFEST_DIGEST"
-  echo "manifest_body_begin"
-  [ -z "$FM_WORKTREE_MANIFEST_BODY" ] || printf '%s\n' "$FM_WORKTREE_MANIFEST_BODY"
-  echo "manifest_body_end"
-} > "$TMP"
-mv "$TMP" "$ADOPTION"
-trap - EXIT HUP INT TERM
-echo "verified: adopted $WORKTREE_REAL for $ID from pool status $FM_WORKTREE_POOL_STATUS with manifest $FM_WORKTREE_MANIFEST_DIGEST"
+if [ -e "$PENDING" ]; then
+  fm_worktree_adoption_proves "$PENDING" "$ID" "$WORKTREE_REAL" "$PROJECT_REAL" "$EXPECTED" \
+    || refuse "partial adoption evidence is quarantined because its original manifest no longer matches"
+  mv "$PENDING" "$ADOPTION"
+else
+  write_manifest_record "$ADOPTION"
+fi
+fm_worktree_adoption_proves "$ADOPTION" "$ID" "$WORKTREE_REAL" "$PROJECT_REAL" "$EXPECTED" \
+  || refuse "published adoption proof could not be verified"
+echo "verified: adopted $WORKTREE_REAL under durable lease $EXPECTED"
